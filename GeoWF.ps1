@@ -1,5 +1,6 @@
 ﻿[cmdletbinding(DefaultParameterSetName=$false)]
 Param(
+  # Mandatory parameter set "Rule" with a list of country codes using ValidateSet for restriction
   [Parameter(ParameterSetName="Rule", Mandatory=$true)]
   [ValidateSet(
     "AD", "AE", "AF", "AG", "AI", "AL", "AM", "AO", "AQ", "AR", "AS", "AT", "AU", "AW", "AX", "AZ",
@@ -21,6 +22,7 @@ Param(
   )]
   [string[]]$Country,
 
+  # Optional parameters to target firewall rules
   [Parameter(ParameterSetName="Rule", Mandatory=$false)]
   [string[]]$RuleName,
 
@@ -31,124 +33,141 @@ Param(
   [string[]]$RuleDisplayGroup,
 
   [Parameter(ParameterSetName="Rule", Mandatory=$false)]
-  [switch]$ExcludeLocalSubnet,
+  [switch]$ExcludeLocalSubnet, # Currently not used
 
+  # Parameter set to list countries
   [Parameter(ParameterSetName="ListCountries", Mandatory=$true)]
   [switch]$ListCountries,
 
+  # MaxMind license key for downloading GeoIP data
   [Parameter(Mandatory=$false)]
   [string]$MaxMindLicenseKey,
 
+  # Force re-download of the GeoIP database
   [Parameter(Mandatory=$false)]
   [switch]$ForceDownload=$false
 )
 
+# Stop execution on errors
 $ErrorActionPreference = "Stop"
 
 # Constants
 $APP_DIR = Join-Path $env:LOCALAPPDATA "GeoWF"
 $MAXMIND_LICENSE_KEY_FILE = Join-Path $APP_DIR "maxmind_license_key.txt"
 $GEOIP_URL_TEMPLATE = "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country-CSV&license_key={0}&suffix=zip"
-$MAXIMUM_RANGES = 9999
 
-# Variables
+# Maximum number of ranges per firewall rule
+$MAXIMUM_RANGES = 10000
+
+# Determine if we are updating rules
 $RuleUpdateDesired = $PSCmdlet.ParameterSetName -eq "Rule"
 
-# Create AppData directory
+# Create the application directory if it doesn't exist
 if (!(Test-Path $APP_DIR)) {
   [void](New-Item -ItemType Directory -Force $APP_DIR)
 }
 
-# MaxMind license key
+# Save or load the MaxMind license key
 if ($MaxMindLicenseKey) {
   ($MaxMindLicenseKey -replace "\s", "") | Out-File -FilePath $MAXMIND_LICENSE_KEY_FILE -NoNewline
   Write-Information ("License key saved to `"{0}`"." -f $MAXMIND_LICENSE_KEY_FILE)
 }
 if (!(Test-Path $MAXMIND_LICENSE_KEY_FILE)) {
-  throw "`"$MAXMIND_LICENSE_KEY_FILE`" not found. Set -MaxMindLicenseKey parameter to specify and store MaxMind license key.`r`n" +
-        "Create a free account at https://www.maxmind.com/en/geolite2/signup"
+  throw "License key file not found. Set -MaxMindLicenseKey parameter to save a valid license key. Create a free account at https://www.maxmind.com/en/geolite2/signup."
 }
 $MaxMindLicenseKey = (Get-Content $MAXMIND_LICENSE_KEY_FILE) -replace "\s", ""
 if (!$RuleUpdateDesired -and !$ForceDownload -and !$ListCountries) { exit }
 
-# Path variables
+# Define GeoIP paths
 $GeoIPURL = ($GEOIP_URL_TEMPLATE -f $MaxMindLicenseKey)
 $GeoIPDir = Join-Path $APP_DIR "GeoIP"
 $GeoIPZip = Join-Path $APP_DIR "GeoIP.zip"
 
-# Delete GeoIP directory if forcing download
+# Re-download GeoIP data if forced
 if ($ForceDownload -and (Test-Path $GeoIPDir)) {
-  Write-Information "Deleting GeoIP data directory."
+  Write-Information "Deleting existing GeoIP data."
   Remove-Item $GeoIPDir -Recurse -Force -Confirm:$false
 }
 
-# Download MaxMind databases if not present
+# Download and extract GeoIP database
 if (!(Test-Path $GeoIPDir)) {
-  Write-Information "Downloading `"$GeoIPURL`"..."
+  Write-Information "Downloading GeoIP database..."
   Invoke-WebRequest $GeoIPURL -OutFile $GeoIPZip
-  Write-Information "Extracting `"$GeoIPZip`"..."
+  Write-Information "Extracting GeoIP database..."
   Add-Type -AssemblyName System.IO.Compression.FileSystem
   [System.IO.Compression.ZipFile]::ExtractToDirectory($GeoIPZip, $APP_DIR)
-  Rename-Item -Path (Get-Item -Path (Join-Path $APP_DIR "GeoLite2-Country-CSV_*") | Sort-Object "Name" -Descending)[0] -NewName "GeoIP"
+  Rename-Item -Path (Get-Item -Path (Join-Path $APP_DIR "GeoLite2-Country-CSV_*") | Sort-Object Name -Descending)[0] -NewName "GeoIP"
   Remove-Item $GeoIPZip -Force -Confirm:$false
 }
 
-# Ensure at least one rule criteria is specified if in rule update mode
-if ($RuleUpdateDesired) {
-  if (!($RuleName -or $RuleDisplayName -or $RuleDisplayGroup)) {
-    throw "You must specify at least one of the following parameters: -RuleName, -RuleDisplayName, -RuleDisplayGroup."
-  }
-} else {
-  if (!$ListCountries) {
-    exit
-  }
-}
+# Import country and network data
+Write-Information "Importing country data..."
+$CountryLocations = Import-Csv (Join-Path $GeoIPDir "GeoLite2-Country-Locations-en.csv")
 
-# Import country definitions from CSV
-if (!$CountryLocations)  {
-  Write-Information "Importing country locations..."
-  $CountryLocations  = Import-Csv (Join-Path $GeoIPDir "GeoLite2-Country-Locations-en.csv")
-}
-
-# List countries and exit
 if ($ListCountries) {
-  $CountryLocations | ? { $_.country_name -match "\w" } | Sort-Object "country_name" | Select-Object `
+  $CountryLocations | Where-Object { $_.country_name -match "\w" } | Sort-Object country_name | Select-Object `
     @{ n = "CountryName"; e = { $_.country_name } },
     @{ n = "CountryCode"; e = { $_.country_iso_code } }
   exit
 }
 
-# Import GeoIP data
-if (!$CountryBlocksIPv4) {
-  Write-Information "Importing IPv4 country blocks..."
-  $CountryBlocksIPv4 = Import-Csv (Join-Path $GeoIPDir "GeoLite2-Country-Blocks-IPv4.csv")
-}
+Write-Information "Importing IPv4 network blocks..."
+$CountryBlocksIPv4 = Import-Csv (Join-Path $GeoIPDir "GeoLite2-Country-Blocks-IPv4.csv")
 
-$CountriesGeonameIDs = ($CountryLocations | ? { $Country -contains $_.country_iso_code }).geoname_id
+# Match countries to GeoNames IDs
+$CountriesGeonameIDs = ($CountryLocations | Where-Object { $Country -contains $_.country_iso_code }).geoname_id
 
-Write-Information "Getting networks..."
-$Networks = ($CountryBlocksIPv4 | ? { $CountriesGeonameIDs -contains $_.geoname_id }).network
-Write-Information ("{0} IP ranges retrieved." -f $Networks.Count)
+# Extract IP networks matching the selected countries
+Write-Information "Extracting IP networks..."
+$Networks = ($CountryBlocksIPv4 | Where-Object { $CountriesGeonameIDs -contains $_.geoname_id }).network
 
-if (!$ExcludeLocalSubnet) {
-  $Networks += "LocalSubnet"
-}
-
-if ($Networks.Count -gt $MAXIMUM_RANGES) {
-  throw "List of IP ranges exceeds the Windows Firewall maximum of $MAXIMUM_RANGES."
-}
-
-# Search Windows Firewall on selected criteria
+# Search for matching firewall rules
 $TargetRules = @()
-if ($RuleName)         { $TargetRules += Get-NetFirewallRule -Name $RuleName                 | ? { $_.Direction -eq "Inbound" } }
-if ($RuleDisplayName)  { $TargetRules += Get-NetFirewallRule -DisplayName $RuleDisplayName   | ? { $_.Direction -eq "Inbound" } }
-if ($RuleDisplayGroup) { $TargetRules += Get-NetFirewallRule -DisplayGroup $RuleDisplayGroup | ? { $_.Direction -eq "Inbound" } }
+if ($RuleName) { $TargetRules += Get-NetFirewallRule -Name $RuleName | Where-Object { $_.Direction -eq "Inbound" } }
+if ($RuleDisplayName) { $TargetRules += Get-NetFirewallRule -DisplayName $RuleDisplayName | Where-Object { $_.Direction -eq "Inbound" } }
+if ($RuleDisplayGroup) {
+  try {
+    $TargetRules += Get-NetFirewallRule -DisplayGroup $RuleDisplayGroup | Where-Object { $_.Direction -eq "Inbound" }
+  } catch {
+    Write-Information "No rules found for DisplayGroup '$RuleDisplayGroup'. New rules will be created."
+  }
+}
 
-# Update Windows Firewall
-if (($TargetRules | measure).Count -gt 0) {
-  Write-Host "Modifying these rules with $($Networks.Count) networks:"
-  $TargetRules | Select-Object Direction, DisplayName, DisplayGroup, Profile
-  Set-NetFirewallRule -Name $TargetRules.Name -RemoteAddress $Networks
+if ($TargetRules.Count -gt 0) {
+    Write-Host "Updating existing firewall rules with IP ranges."
+
+    $NumberOfChunks = [math]::Ceiling($Networks.Count / $MAXIMUM_RANGES)
+
+    for ($chunkIndex = 0; $chunkIndex -lt $NumberOfChunks; $chunkIndex++) {
+        $start = $chunkIndex * $MAXIMUM_RANGES
+        $end = [math]::Min($start + $MAXIMUM_RANGES - 1, $Networks.Count - 1)
+        $currentChunk = $Networks[$start..$end]
+
+        Set-NetFirewallRule -Name $TargetRules.Name -RemoteAddress $currentChunk
+    }
 } else {
-  Write-Warning "No firewall rules matched criteria. No rules have been modified."
+    Write-Warning "No matching firewall rules found. Creating new rules."
+
+    $NumberOfChunks = [math]::Ceiling($Networks.Count / $MAXIMUM_RANGES)
+
+    for ($chunkIndex = 0; $chunkIndex -lt $NumberOfChunks; $chunkIndex++) {
+        $start = $chunkIndex * $MAXIMUM_RANGES
+        $end = [math]::Min($start + $MAXIMUM_RANGES - 1, $Networks.Count - 1)
+        $currentChunk = $Networks[$start..$end]
+
+        $newRuleName = "GeoRule_$RuleDisplayGroup_Part$($chunkIndex+1)"
+        $newDisplayName = "$RuleDisplayGroup (Part $($chunkIndex+1))"
+
+        Write-Host "Creating new rule: $newRuleName"
+
+        # Ensure -Group is always a string
+        New-NetFirewallRule -Name $newRuleName `
+                            -DisplayName $newDisplayName `
+                            -Direction Inbound `
+                            -Action Block `
+                            -RemoteAddress $currentChunk `
+                            -Group ($RuleDisplayGroup -join "") `
+                            -Protocol Any `
+                            -Verbose
+    }
 }
